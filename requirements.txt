@@ -4,3 +4,4 @@ pyarrow>=14.0.0
 vectorbt
 pytest
 ta==0.11.0
+sqlite-utils>=3.30
