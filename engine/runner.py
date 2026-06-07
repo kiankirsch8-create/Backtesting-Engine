@@ -183,7 +183,11 @@ def compute_metrics(portfolio: vbt.Portfolio) -> BacktestMetrics:
     losses = pnl[pnl < 0]
 
     win_rate = round(float(len(wins) / len(pnl)), 4)
-    if len(losses) == 0:
+    if len(wins) == 0:
+        win_loss_ratio = 0.0
+    elif len(losses) == 0:
+        win_loss_ratio = 999.0
+    elif losses.mean() == 0 or np.isnan(losses.mean()):
         win_loss_ratio = 999.0
     else:
         win_loss_ratio = round(float(wins.mean() / abs(losses.mean())), 4)
