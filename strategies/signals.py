@@ -4,7 +4,7 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
+import ta
 
 from strategies.schema import SignalOutput
 
@@ -152,7 +152,7 @@ def _ema(series: pd.Series, period: int) -> pd.Series:
     Returns:
         EMA series.
     """
-    return ta.ema(series, length=period)
+    return ta.trend.ema_indicator(series, window=period)
 
 
 def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -166,8 +166,153 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     Returns:
         ATR series.
     """
-    return ta.atr(df["high"], df["low"], df["close"], length=period)
+    return ta.volatility.average_true_range(
+        df["high"], df["low"], df["close"], window=period
+    )
 
+
+def _hma(series: pd.Series, period: int) -> pd.Series:
+    """Hull Moving Average via EMA composition."""
+    half = max(1, period // 2)
+    sqrt_n = max(1, int(np.sqrt(period)))
+    ema_half = ta.trend.ema_indicator(series, window=half)
+    ema_full = ta.trend.ema_indicator(series, window=period)
+    raw = 2 * ema_half - ema_full
+    return ta.trend.ema_indicator(raw, window=sqrt_n)
+
+
+def _adx(df: pd.DataFrame, period: int) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """ADX, +DI, -DI from the ta library."""
+    from ta.trend import ADXIndicator
+
+    indicator = ADXIndicator(df["high"], df["low"], df["close"], window=period)
+    return indicator.adx(), indicator.adx_pos(), indicator.adx_neg()
+
+
+def _supertrend(df: pd.DataFrame, period: int, multiplier: float) -> pd.Series:
+    """Supertrend direction series (+1 bullish, -1 bearish)."""
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
+    atr = ta.volatility.average_true_range(
+        df["high"], df["low"], df["close"], window=period
+    ).to_numpy(dtype=float)
+    n = len(close)
+    direction = np.ones(n, dtype=int)
+    final_upper = np.zeros(n)
+    final_lower = np.zeros(n)
+    hl2 = (high + low) / 2.0
+    basic_upper = hl2 + multiplier * atr
+    basic_lower = hl2 - multiplier * atr
+    final_upper[0] = basic_upper[0]
+    final_lower[0] = basic_lower[0]
+    for i in range(1, n):
+        final_upper[i] = (
+            basic_upper[i]
+            if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]
+            else final_upper[i - 1]
+        )
+        final_lower[i] = (
+            basic_lower[i]
+            if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]
+            else final_lower[i - 1]
+        )
+        if direction[i - 1] == 1:
+            direction[i] = -1 if close[i] < final_lower[i] else 1
+        else:
+            direction[i] = 1 if close[i] > final_upper[i] else -1
+    return pd.Series(direction, index=df.index)
+
+
+def _ichimoku(
+    df: pd.DataFrame, tenkan: int, kijun: int, senkou: int
+) -> dict[str, pd.Series]:
+    """Ichimoku components computed from rolling extrema."""
+    high = df["high"]
+    low = df["low"]
+    tenkan_line = (high.rolling(tenkan).max() + low.rolling(tenkan).min()) / 2
+    kijun_line = (high.rolling(kijun).max() + low.rolling(kijun).min()) / 2
+    senkou_a = (tenkan_line + kijun_line) / 2
+    senkou_b = (high.rolling(senkou).max() + low.rolling(senkou).min()) / 2
+    return {
+        "tenkan": tenkan_line,
+        "kijun": kijun_line,
+        "senkou_a": senkou_a,
+        "senkou_b": senkou_b,
+    }
+
+
+def _psar(
+    df: pd.DataFrame, af0: float, max_af: float
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Parabolic SAR long/short levels and reversal flags."""
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    n = len(high)
+    psar_l = np.full(n, np.nan)
+    psar_s = np.full(n, np.nan)
+    reversal = np.zeros(n, dtype=bool)
+    bull = True
+    af = af0
+    ep = high[0]
+    psar = low[0]
+    psar_l[0] = psar
+    for i in range(1, n):
+        prev_psar = psar
+        psar = prev_psar + af * (ep - prev_psar)
+        if bull:
+            psar = min(psar, low[i - 1], low[i - 2] if i > 1 else low[i - 1])
+            if low[i] < psar:
+                bull = False
+                reversal[i] = True
+                psar = ep
+                ep = low[i]
+                af = af0
+            elif high[i] > ep:
+                ep = high[i]
+                af = min(af + af0, max_af)
+        else:
+            psar = max(psar, high[i - 1], high[i - 2] if i > 1 else high[i - 1])
+            if high[i] > psar:
+                bull = True
+                reversal[i] = True
+                psar = ep
+                ep = high[i]
+                af = af0
+            elif low[i] < ep:
+                ep = low[i]
+                af = min(af + af0, max_af)
+        if bull:
+            psar_l[i] = psar
+        else:
+            psar_s[i] = psar
+    idx = df.index
+    return (
+        pd.Series(psar_l, index=idx),
+        pd.Series(psar_s, index=idx),
+        pd.Series(reversal, index=idx),
+    )
+
+
+def _bbands(
+    close: pd.Series, length: int, std: float
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Bollinger lower, upper, and middle bands."""
+    bands = ta.volatility.BollingerBands(close, window=length, window_dev=std)
+    return bands.bollinger_lband(), bands.bollinger_hband(), bands.bollinger_mavg()
+
+
+def _keltner(
+    df: pd.DataFrame, length: int, multiplier: float
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Keltner lower, middle, and upper channels."""
+    middle = ta.trend.ema_indicator(df["close"], window=length)
+    atr = ta.volatility.average_true_range(
+        df["high"], df["low"], df["close"], window=length
+    )
+    upper = middle + multiplier * atr
+    lower = middle - multiplier * atr
+    return lower, middle, upper
 
 
 def _crosses_above_level(series: pd.Series, level: float) -> pd.Series:
@@ -349,13 +494,7 @@ def signal_adx_trend(df: pd.DataFrame, params: dict) -> SignalOutput:
     """
     adx_period = params.get("adx_period", 14)
     adx_threshold = params.get("adx_threshold", 25)
-    adx_df = ta.adx(df["high"], df["low"], df["close"], length=adx_period)
-    adx_col = _col_starting(adx_df.columns, "ADX")
-    dmp_col = _col_starting(adx_df.columns, "DMP")
-    dmn_col = _col_starting(adx_df.columns, "DMN")
-    adx = adx_df[adx_col]
-    dmp = adx_df[dmp_col]
-    dmn = adx_df[dmn_col]
+    adx, dmp, dmn = _adx(df, adx_period)
     strong = adx > adx_threshold
     long_entries = strong & _crosses_above(dmp, dmn)
     short_entries = strong & _crosses_below(dmp, dmn)
@@ -393,11 +532,7 @@ def signal_supertrend(df: pd.DataFrame, params: dict) -> SignalOutput:
     """
     period = params.get("period", 10)
     multiplier = params.get("multiplier", 3.0)
-    st = ta.supertrend(
-        df["high"], df["low"], df["close"], length=period, multiplier=multiplier
-    )
-    dir_col = _col_starting(st.columns, "SUPERTd")
-    direction = st[dir_col]
+    direction = _supertrend(df, period, multiplier)
     prev_dir = direction.shift(1)
     long_entries = (direction == 1) & (prev_dir == -1)
     short_entries = (direction == -1) & (prev_dir == 1)
@@ -435,8 +570,8 @@ def signal_hull_ma_cross(df: pd.DataFrame, params: dict) -> SignalOutput:
     """
     fast_period = params.get("fast_period", 9)
     slow_period = params.get("slow_period", 21)
-    hma_fast = ta.hma(df["close"], length=fast_period)
-    hma_slow = ta.hma(df["close"], length=slow_period)
+    hma_fast = _hma(df["close"], fast_period)
+    hma_slow = _hma(df["close"], slow_period)
     long_entries = _crosses_above(hma_fast, hma_slow)
     long_exits = _crosses_below(hma_fast, hma_slow)
     short_entries = _crosses_below(hma_fast, hma_slow)
@@ -475,13 +610,9 @@ def signal_ichimoku_cloud_break(df: pd.DataFrame, params: dict) -> SignalOutput:
     tenkan = params.get("tenkan", 9)
     kijun = params.get("kijun", 26)
     senkou = params.get("senkou", 52)
-    ichi = ta.ichimoku(
-        df["high"], df["low"], df["close"],
-        tenkan=tenkan, kijun=kijun, senkou=senkou,
-    )
-    cloud = ichi[0]
-    isa = cloud["ISA_9"] if "ISA_9" in cloud.columns else cloud.iloc[:, 0]
-    isb = cloud["ISB_26"] if "ISB_26" in cloud.columns else cloud.iloc[:, 1]
+    ichi = _ichimoku(df, tenkan, kijun, senkou)
+    isa = ichi["senkou_a"]
+    isb = ichi["senkou_b"]
     cloud_top = isa.combine(isb, max)
     cloud_bottom = isa.combine(isb, min)
     long_entries = _crosses_above(df["close"], cloud_top)
@@ -522,13 +653,9 @@ def signal_ichimoku_tk_cross(df: pd.DataFrame, params: dict) -> SignalOutput:
     tenkan_p = params.get("tenkan", 9)
     kijun_p = params.get("kijun", 26)
     senkou_p = params.get("senkou", 52)
-    ichi = ta.ichimoku(
-        df["high"], df["low"], df["close"],
-        tenkan=tenkan_p, kijun=kijun_p, senkou=senkou_p,
-    )
-    cloud = ichi[0]
-    tenkan = cloud["ITS_9"] if "ITS_9" in cloud.columns else cloud.iloc[:, 2]
-    kijun = cloud["IKS_26"] if "IKS_26" in cloud.columns else cloud.iloc[:, 3]
+    ichi = _ichimoku(df, tenkan_p, kijun_p, senkou_p)
+    tenkan = ichi["tenkan"]
+    kijun = ichi["kijun"]
     long_entries = _crosses_above(tenkan, kijun)
     long_exits = _crosses_below(tenkan, kijun)
     short_entries = _crosses_below(tenkan, kijun)
@@ -565,13 +692,9 @@ def signal_parabolic_sar_trend(df: pd.DataFrame, params: dict) -> SignalOutput:
     """
     af0 = params.get("af0", 0.02)
     af = params.get("af", 0.2)
-    psar = ta.psar(df["high"], df["low"], df["close"], af0=af0, af=af)
-    psar_l = _col_starting(psar.columns, "PSARl")
-    psar_s = _col_starting(psar.columns, "PSARs")
-    psar_r = _col_starting(psar.columns, "PSARr")
-    reversal = psar[psar_r] == 1
-    long_active = psar[psar_l].notna()
-    short_active = psar[psar_s].notna()
+    psar_long, psar_short, reversal = _psar(df, af0, af)
+    long_active = psar_long.notna()
+    short_active = psar_short.notna()
     long_entries = reversal & long_active
     short_entries = reversal & short_active
     long_exits = reversal & short_active
@@ -772,7 +895,7 @@ def signal_rsi_threshold(df: pd.DataFrame, params: dict) -> SignalOutput:
     rsi_period = params.get("rsi_period", 14)
     oversold = params.get("oversold", 30)
     overbought = params.get("overbought", 70)
-    rsi = ta.rsi(df["close"], length=rsi_period)
+    rsi = ta.momentum.rsi(df["close"], window=rsi_period)
     long_entries = _crosses_above_level(rsi, oversold)
     short_entries = _crosses_below_level(rsi, overbought)
     long_exits = _crosses_above_level(rsi, overbought)
@@ -809,7 +932,7 @@ def signal_rsi_momentum_break(df: pd.DataFrame, params: dict) -> SignalOutput:
     """
     rsi_period = params.get("rsi_period", 14)
     midline = params.get("midline", 50)
-    rsi = ta.rsi(df["close"], length=rsi_period)
+    rsi = ta.momentum.rsi(df["close"], window=rsi_period)
     long_entries = _crosses_above_level(rsi, midline)
     long_exits = _crosses_below_level(rsi, midline)
     short_entries = _crosses_below_level(rsi, midline)
@@ -848,11 +971,10 @@ def signal_macd_cross(df: pd.DataFrame, params: dict) -> SignalOutput:
     fast = params.get("fast", 12)
     slow = params.get("slow", 26)
     signal_len = params.get("signal", 9)
-    macd_df = ta.macd(df["close"], fast=fast, slow=slow, signal=signal_len)
-    macd_col = _col_starting(macd_df.columns, "MACD_")
-    sig_col = _col_starting(macd_df.columns, "MACDs_")
-    macd_line = macd_df[macd_col]
-    signal_line = macd_df[sig_col]
+    macd_line = ta.trend.macd(df["close"], window_slow=slow, window_fast=fast)
+    signal_line = ta.trend.macd_signal(
+        df["close"], window_slow=slow, window_fast=fast, window_sign=signal_len
+    )
     long_entries = _crosses_above(macd_line, signal_line)
     long_exits = _crosses_below(macd_line, signal_line)
     short_entries = _crosses_below(macd_line, signal_line)
@@ -887,7 +1009,7 @@ def signal_cci_momentum(df: pd.DataFrame, params: dict) -> SignalOutput:
         cci_period.
     """
     cci_period = params.get("cci_period", 20)
-    cci = ta.cci(df["high"], df["low"], df["close"], length=cci_period)
+    cci = ta.trend.cci(df["high"], df["low"], df["close"], window=cci_period)
     long_entries = _crosses_above_level(cci, 0.0)
     long_exits = _crosses_below_level(cci, 0.0)
     short_entries = _crosses_below_level(cci, 0.0)
@@ -926,7 +1048,7 @@ def signal_cci_extreme(df: pd.DataFrame, params: dict) -> SignalOutput:
     cci_period = params.get("cci_period", 20)
     upper = params.get("upper", 100)
     lower = params.get("lower", -100)
-    cci = ta.cci(df["high"], df["low"], df["close"], length=cci_period)
+    cci = ta.trend.cci(df["high"], df["low"], df["close"], window=cci_period)
     long_entries = _crosses_above_level(cci, lower)
     short_entries = _crosses_below_level(cci, upper)
     long_exits = _crosses_above_level(cci, upper)
@@ -965,7 +1087,7 @@ def signal_williams_r(df: pd.DataFrame, params: dict) -> SignalOutput:
     period = params.get("period", 14)
     oversold = params.get("oversold", -80)
     overbought = params.get("overbought", -20)
-    wr = ta.willr(df["high"], df["low"], df["close"], length=period)
+    wr = ta.momentum.williams_r(df["high"], df["low"], df["close"], lbp=period)
     long_entries = _crosses_above_level(wr, oversold)
     short_entries = _crosses_below_level(wr, overbought)
     long_exits = _crosses_above_level(wr, overbought)
@@ -1002,7 +1124,7 @@ def signal_roc_threshold(df: pd.DataFrame, params: dict) -> SignalOutput:
     """
     roc_period = params.get("roc_period", 10)
     threshold = params.get("threshold", 0.0)
-    roc = ta.roc(df["close"], length=roc_period)
+    roc = ((df["close"] - df["close"].shift(roc_period)) / df["close"].shift(roc_period)) * 100
     long_entries = _crosses_above_level(roc, threshold)
     long_exits = _crosses_below_level(roc, threshold)
     short_entries = _crosses_below_level(roc, -threshold if threshold != 0 else threshold)
@@ -1045,14 +1167,13 @@ def signal_stochastic_cross(df: pd.DataFrame, params: dict) -> SignalOutput:
     smooth_k = params.get("smooth_k", 3)
     oversold = params.get("oversold", 20)
     overbought = params.get("overbought", 80)
-    stoch = ta.stoch(
-        df["high"], df["low"], df["close"],
-        k=k_period, d=d_period, smooth_k=smooth_k,
+    from ta.momentum import StochasticOscillator
+
+    stoch = StochasticOscillator(
+        df["high"], df["low"], df["close"], window=k_period, smooth_window=smooth_k
     )
-    k_col = _col_starting(stoch.columns, "STOCHk")
-    d_col = _col_starting(stoch.columns, "STOCHd")
-    k_line = stoch[k_col]
-    d_line = stoch[d_col]
+    k_line = stoch.stoch()
+    d_line = k_line.rolling(d_period).mean()
     long_entries = _crosses_above(k_line, d_line) & (k_line.shift(1) < oversold)
     short_entries = _crosses_below(k_line, d_line) & (k_line.shift(1) > overbought)
     long_exits = _crosses_below(k_line, d_line)
@@ -1089,13 +1210,7 @@ def signal_bollinger_reversion(df: pd.DataFrame, params: dict) -> SignalOutput:
     """
     length = params.get("length", 20)
     std = params.get("std", 2.0)
-    bb = ta.bbands(df["close"], length=length, std=std)
-    lower_col = _col_starting(bb.columns, "BBL")
-    upper_col = _col_starting(bb.columns, "BBU")
-    mid_col = _col_starting(bb.columns, "BBM")
-    lower = bb[lower_col]
-    upper = bb[upper_col]
-    mid = bb[mid_col]
+    lower, upper, mid = _bbands(df["close"], length, std)
     long_entries = (df["low"].shift(1) <= lower.shift(1)) & (df["close"] > lower)
     short_entries = (df["high"].shift(1) >= upper.shift(1)) & (df["close"] < upper)
     long_exits = (df["close"] >= mid) & (df["close"].shift(1) < mid.shift(1))
@@ -1132,13 +1247,7 @@ def signal_bollinger_walk(df: pd.DataFrame, params: dict) -> SignalOutput:
     """
     length = params.get("length", 20)
     std = params.get("std", 2.0)
-    bb = ta.bbands(df["close"], length=length, std=std)
-    lower_col = _col_starting(bb.columns, "BBL")
-    upper_col = _col_starting(bb.columns, "BBU")
-    mid_col = _col_starting(bb.columns, "BBM")
-    lower = bb[lower_col]
-    upper = bb[upper_col]
-    mid = bb[mid_col]
+    lower, upper, mid = _bbands(df["close"], length, std)
     long_entries = _crosses_above(df["close"], upper)
     short_entries = _crosses_below(df["close"], lower)
     long_exits = _crosses_below(df["close"], mid)
@@ -1181,13 +1290,11 @@ def signal_squeeze_break(df: pd.DataFrame, params: dict) -> SignalOutput:
     kc_length = params.get("kc_length", 20)
     kc_scalar = params.get("kc_scalar", 1.5)
     breakout_lookback = params.get("breakout_lookback", 20)
-    sqz = ta.squeeze(
-        df["high"], df["low"], df["close"],
-        bb_length=bb_length, bb_std=bb_std,
-        kc_length=kc_length, kc_scalar=kc_scalar,
-    )
-    squeeze_on = sqz["SQZ_ON"].fillna(False).astype(bool)
-    squeeze_off = sqz["SQZ_OFF"].fillna(False).astype(bool)
+    bb_lower, bb_upper, _ = _bbands(df["close"], bb_length, bb_std)
+    kc_lower, _, kc_upper = _keltner(df, kc_length, kc_scalar)
+    squeeze_on = (bb_upper < kc_upper) & (bb_lower > kc_lower)
+    squeeze_on = squeeze_on.fillna(False).astype(bool)
+    squeeze_off = (~squeeze_on).astype(bool)
     release = squeeze_on.shift(1).fillna(False) & squeeze_off
     upper = _rolling_high(df["high"], breakout_lookback)
     lower = _rolling_low(df["low"], breakout_lookback)
@@ -2776,3 +2883,14 @@ SIGNAL_REGISTRY: dict[str, Callable[[pd.DataFrame, dict], SignalOutput]] = {
     "signal_star_pattern": signal_star_pattern,
     "signal_apex_native_placeholder": signal_apex_native_placeholder,
 }
+
+if __name__ == "__main__":
+    import pandas as pd
+
+    df = pd.read_parquet("data/cache/EURUSD_1d.parquet")
+    from strategies.signals import signal_ema_cross, signal_supertrend, signal_rsi_threshold
+
+    print(signal_ema_cross(df, {}))
+    print(signal_supertrend(df, {}))
+    print(signal_rsi_threshold(df, {}))
+    print("All OK")
